@@ -1,0 +1,9 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+infra/deployment.auto.tfvars.json
+/service/service
+__pycache__/

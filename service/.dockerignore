@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!go.mod
+!go.sum
+!*.go
+!schema.sql
+!rds-ca-bundle.pem
+!storage/
+!storage/**

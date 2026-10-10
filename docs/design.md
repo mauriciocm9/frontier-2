@@ -17,51 +17,55 @@ Known behavior:
 
 ## 2. Problem
 
-1. **Unknown behavior.** We only have black-box access. Unverified: exact limit threshold, effect of `ANULA` on balances, validation order, argument constraints, unknown routes, `/health` body.
-2. **Money correctness.** Retries, concurrent requests and crashes must never create double spending, lost updates, negative balances or half-applied transfers.
+1. **Unknown behavior.** We only have black-box access. Remaining risks include untested argument limits, large-number behavior and suggestion rules.
+2. **Money correctness.** Retries, concurrent requests and crashes must never create double spending, lost updates or half-applied transfers. Compatibility deliberately preserves negative balances caused by cancellation, as observed and requested.
 3. **Exact compatibility.** Hidden tests compare status and body exactly, typos included.
 
 Approach: test the original systematically (log every request with a hypothesis, sweeps, boundary values), turn every verified behavior into a replayable test, and build on standard transaction patterns so the system is safe even where the original's behavior is unknown.
 
 ## 3. Solution (single phase)
 
-A Go monolith with PostgreSQL as the only source of truth. Processing is synchronous: the response already contains the final result, as the original returns E401/E506/E507 on the request itself.
+One Go binary, deployed as two ECS Fargate services: exactly **one API task, one worker task, and one active Kinesis shard**. RDS PostgreSQL is the source of truth. ALTA, CONSULTA and PING execute in the API; DEPOSITO, TRANSFER and ANULA execute in the worker. The API waits for the stored result, preserving synchronous business errors.
 
-A queue or stream (Kinesis, SQS FIFO) was considered and left out: it does not dedup by itself (still needs a Postgres unique key), it complicates two-account transfers, and it turns synchronous errors into request/reply. It can be added later without changing the data model.
+The worker has a single processing loop: record 1 commits before record 2 begins. All payment records arrive in the same shard. Autoscaling is disabled. Deployments stop the old task before starting its replacement (maximum 100%, minimum healthy 0%), accepting a brief interruption rather than two consumers.
 
 ### 3.1 Components
-- **HTTP router:** `/health`, `/__reset`, `/msg`, default 404; auth middleware.
+- **HTTP router:** authenticated `/health`, `/__reset`, `/msg`, default 404; separate unauthenticated `/ready` for ALB health checks.
 - **Parser/validator:** split message, check control, command, arity, argument format (before opening a transaction).
-- **Command handlers:** one DB transaction each.
-- **PostgreSQL:** `accounts`, `operations`, `ledger_entries`.
-- **Payments port:** an interface for an external payments service. No such service is confirmed **[?]**; the core works without it.
+- **Outbox publisher:** reliably sends accepted operation IDs to Kinesis, partitioned by tenant and source account; serializes publication per partition across API tasks.
+- **Worker:** one synchronous batch-processing loop, without per-record or per-shard processing goroutines. Expiring PostgreSQL leases and fencing protect restart; checkpoints and effects commit together. Historical parent shards drain before the merged single shard during migration.
+- **Storage package:** `service/storage`, with explicit `CreateAccount`, `GetAccount`, `QueueDeposit`, `QueueTransfer`, `QueueCancellation`, `OperationResult`, and `Reset` methods. Financial handlers are separated into deposit, transfer and cancellation functions. SQL and transaction management remain inside the package.
+- **PostgreSQL:** `tenants`, `accounts`, `operations`, `outbox`, `ledger_entries`, `shard_leases`, `dead_letters`.
+- **External payments:** unconfirmed; no provider is called by this implementation.
 
 ### 3.2 Data model
-- `accounts(id, name, balance BIGINT CHECK (balance >= 0), created_at)`; money in integer units, never floats.
-- `operations(id, type, from_account, to_account, amount, status, idempotency_key UNIQUE, created_at, updated_at)`; status `received -> completed | failed | cancelled`.
-- `ledger_entries(id, operation_id, account_id, delta, created_at)`; append-only double entry (debit + credit sum to zero), so balances can always be audited.
-- Sequences for `AC-` and `OP-` ids, restarted by `/__reset`.
+- `accounts`: tenant, reset generation, public ID, name, signed BIGINT balance; integer units, never floats. Cancellation overdrafts are allowed for compatibility.
+- `operations`: immutable UUID request ID, optional client key, fingerprint, command, arguments, amount, public ID, stored HTTP response and status. Unique key per tenant/generation; state `received -> completed | failed`, with successful money operations optionally `completed -> cancelled`.
+- `ledger_entries`: two opposing entries per effect, including a cash-clearing entry for deposits. A deferred database trigger rejects unbalanced journals.
+- `tenants`: transactional AC/OP counters and reset generation. Failed operations do not consume public OP identifiers. Reset clears business data and increments generation; old Kinesis records cannot affect new accounts.
 
 ### 3.3 Concurrency and no-double-spend rules
-1. **Idempotency key** with a unique constraint; a retry returns the stored result. The original has no key field, so we only dedup if tests show retries are expected to **[?]**.
-2. **State machine:** transitions use `UPDATE ... WHERE status = <expected>` and check the row count.
-3. **Row locks in fixed order:** `SELECT ... FOR UPDATE` on the accounts by ascending id (prevents A->B / B->A deadlocks).
-4. **DB constraint** `balance >= 0` backs up the application check.
-5. **Isolation:** `READ COMMITTED` plus explicit locks; `SERIALIZABLE` with retry only if needed.
-6. **Outbox** (only if an external payments service is added): the external call never runs inside the DB transaction; a worker sends outbox rows using the stored key.
+1. **Idempotency:** Kinesis duplicates reuse the immutable request ID. An optional `Idempotency-Key` header deduplicates client retries; without it, repeated identical requests are distinct, matching the original. Reusing a key with different input returns 409.
+2. **State machine:** the worker locks and rechecks operation state before applying effects; terminal operations return their stored result without another balance change.
+3. **Locks:** `READ COMMITTED`, tenant row locks for counters/reset, and account row locks in ascending ID order. Transfers check available funds while holding those locks.
+4. **Fenced checkpoints:** shard ownership is checked under a row lock; an expired or superseded worker cannot apply effects. Checkpoint, ledger, balances and response commit atomically.
+5. **Outbox:** operation and pending event commit together. Publication can repeat after a crash; consumption remains idempotent. Only outbox/publication locks span the Kinesis call, not balance-changing transactions.
+6. **Sequential consumer:** one active shard and one worker loop prevent overlapping payment handlers. This does not serialize HTTP account creation or reset with the worker; database locks still coordinate those requests.
 
 ### 3.4 `TRANSFER` flow
 1. Validate message (control, command, arity, amount).
-2. `BEGIN`; insert the operation; lock both accounts in id order.
-3. Check account existence (E401), balance (E507), limit (E506), in the original's order **[?]**.
-4. Write ledger entries, update balances, mark `completed`, `COMMIT`.
-5. Reply `{"status":"recieved","operacionId":"OP-000N"}`.
+2. API commits operation and outbox; publisher sends its UUID to Kinesis.
+3. Worker locks shard lease, tenant, operation and both accounts. Check existence (E401), limit (E506), then balance (E507), in the observed order **[V]**.
+4. Write balanced ledger entries, update balances, allocate OP ID, save response and checkpoint; commit.
+5. API reads the stored result and replies `{"status":"recieved","operacionId":"OP-000N"}`. If the 4.5-second wait expires, return a pending 503 with the request ID; the operation can still complete. Retry safely using the same client key.
 
 ### 3.5 Testing
 - Replay `pruebas/ejemplos.jsonl` and every logged experiment against the replacement.
 - Differential tests: same random sequences against the original and the replacement after reset, throttled to about 8 req/s.
-- Concurrency tests on the replacement: parallel transfers on shared accounts; assert total balance conserved, no negatives, no duplicate effects.
-- Crash tests: kill the process mid-request, check consistency on restart.
+- Verified locally: concurrent spending, duplicate delivery, client idempotency, reversal overdrafts, stale events after reset, expired/superseded leases and unbalanced-journal rollback.
+- Previous AWS deployment: 20/20 fixture responses matched the current original; concurrency/idempotency tests passed with two API and two worker tasks, as did real Kinesis redelivery and reset fencing.
+- Refactor tests: explicit storage methods retain those transaction guarantees; an ordered deposit, transfer and cancellation batch verifies sequential effects and checkpoint recovery.
+- Further crash tests: kill tasks mid-request and during publication; verify recovery.
 - Periodic canary against the original to detect drift.
 
 ## 4. Edge cases
@@ -71,21 +75,21 @@ Each item is a test to write; the expected behavior is **[?]** unless stated.
 **Message and control**
 - Control `0`, `1`, `99`, `100`, negative, `5X`, empty, 3+ digits; leading zeros (`07`). Known: 1-2 digits required else E201 **[V]**.
 - Valid values 2..98; 97 and 98 occur **[V]**.
-- Order of checks when several fail (bad control + unknown command + wrong arity). Known: wrong arity returned E302 without checking control in one example **[V]**.
+- Order of checks: missing control, empty segment, malformed/incorrect checksum, unknown command, arity, amount, same-account transfer **[V]**. PING skips checksum validation.
 - Empty message, missing `m`, `m` not a string, bad JSON, extra fields, huge body.
 - Lowercase/mixed-case command and arguments **[V]** case-insensitive for the control; stored name casing **[?]**.
 - Extra or missing `;`, trailing `;`, empty arguments, `;` inside names, non-ASCII or very long names (the control formula ignores non-alphanumerics, so some corruptions go undetected).
 
 **Money**
-- Amount `0`, negative, decimals, non-numeric, leading zeros, very large (overflow), exactly at the limit; limit lies between 100000 (ok) and 120000 (E506) **[V]**.
+- Amount `0`, negative, decimals and non-numeric return E303 **[V]**. Transfer limit is 100000 inclusive; 100001 returns E506 **[V]**. BIGINT overflow is rejected by the replacement; larger-number behavior of the original remains unverified.
 - Transfer to the same account; to or from a missing account (which one is reported first); deposit to a missing account.
 - Transfer with insufficient balance at exactly `balance + 1`.
 - Two simultaneous transfers that together exceed the balance (only one may succeed).
 - Opposite transfers at the same time (deadlock avoidance).
 
 **Operations**
-- `ANULA` on unknown id, on already cancelled **[V]**, on a deposit vs a transfer, on a failed operation; effect on balances (observed not restoring in one case **[V]**, unclear).
-- Same request sent twice (new operation vs deduped).
+- `ANULA` reverses deposits and transfers, even if this overdraws an account **[V]**. Unknown OP returns E402; repeated cancellation returns `ya anulada` **[V]**.
+- Same request sent twice: distinct effects without a client key; same stored response with the same key. Test a retry after HTTP timeout.
 - Operation or account ids beyond `9999` (padding), id format case (`ac-0001`).
 
 **HTTP and platform**
@@ -98,27 +102,31 @@ Each item is a test to write; the expected behavior is **[?]** unless stated.
 ## 5. Risks
 - Unobserved behavior differs. Mitigation: differential tests, list unverified items explicitly in the spec.
 - Over-claiming in the spec costs points. Mitigation: mark every item with evidence ids and confidence.
-- Request budget on the original (8000/day, about 2900 used). Mitigation: prioritize experiments by test impact.
+- Cancellation overdrafts are a compatibility risk deliberately preserved; ordinary transfers still reject insufficient funds.
+- The single worker bounds throughput: lag grows when transactions arrive faster than they can be processed. Monitor iterator age; one shard provides ordering within this stream, not timestamp ordering or exactly-once delivery.
+- Restart and stop-before-start deployment cause brief unavailability. Accepted operations remain recoverable through the outbox and checkpoint; clients retry with the same idempotency key.
+- Request budget on the original (8000/day). Mitigation: prioritize experiments by test impact.
 
 ## 6. Architecture
 
 ```mermaid
-flowchart LR
-    Client["Client / test harness"] -->|"HTTPS + Bearer token"| Router
-
-    subgraph App["Go monolith"]
-        Router["HTTP router<br/>GET /health<br/>POST /__reset<br/>POST /msg<br/>404 otherwise"]
-        Auth["Auth middleware"]
-        Parser["Parser / validator<br/>control mod 97-10, command, arity, args"]
-        Handlers["Command handlers<br/>ALTA, CONSULTA, DEPOSITO,<br/>TRANSFER, ANULA, PING"]
-        Port["Payments port<br/>(interface, optional)"]
-        Router --> Auth --> Parser --> Handlers
-        Handlers -.-> Port
+flowchart TB
+    Client[Client] -->|Bearer token| ALB[Application Load Balancer]
+    subgraph VPC[AWS VPC: two availability zones]
+      ALB --> API[One ECS API task: authentication and parsing]
+      API -->|ALTA, CONSULTA, reset; operation and outbox insert| DB[(Private RDS PostgreSQL)]
+      API --> Publisher[API outbox publisher]
+      Publisher -->|Operation UUID| Kinesis[Kinesis: one active shard]
+      Kinesis --> Worker[One ECS worker task: one sequential processing loop]
+      Worker --> Storage[storage package: deposit / transfer / cancelOperation]
+      Storage -->|One transaction: fenced lease, ordered locks, ledger, balances, result and checkpoint| DB
+      DB -->|Stored result| API
+      API -->|Final response; pending 503 on timeout| Client
+      Worker -->|Malformed event| DeadLetters[(PostgreSQL dead_letters)]
+      API --> Logs[CloudWatch Logs]
+      Worker --> Logs
     end
-
-    Handlers -->|"one transaction:<br/>BEGIN, SELECT FOR UPDATE (ordered),<br/>insert operation + ledger, update balance, COMMIT"| DB[("PostgreSQL<br/>accounts<br/>operations (idempotency key UNIQUE)<br/>ledger_entries")]
-    Port -.->|"via outbox, only if confirmed needed"| Ext["External payments service<br/>(assumption, not confirmed)"]
-    Router -->|"POST /__reset: truncate tables,<br/>restart id sequences"| DB
-    Router -->|"GET /health"| Health["Health check"]
-    Health --> DB
+    Secrets[Secrets Manager] --> API
+    Secrets --> Worker
+    Lag[CloudWatch iterator-age alarm; no autoscaling] -. monitors .-> Kinesis
 ```

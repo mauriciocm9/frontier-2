@@ -1,0 +1,4 @@
+region          = "us-east-1"
+name            = "frontier"
+deploy_services = true
+image_tag       = "sequential-20261010-01"
