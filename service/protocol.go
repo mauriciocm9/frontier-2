@@ -28,7 +28,10 @@ type command struct {
 
 func control(prefix string) int {
 	remainder := 0
-	for _, c := range strings.ToUpper(prefix) {
+	for _, c := range prefix {
+		if c >= 'a' && c <= 'z' { // ASCII-only case folding: 'ı' or 'ſ' must not count as letters
+			c -= 'a' - 'A'
+		}
 		if c >= 'A' && c <= 'Z' {
 			for _, d := range strconv.Itoa(int(c-'A') + 1) {
 				remainder = (remainder*10 + int(d-'0')) % 97
@@ -98,7 +101,7 @@ func parseMessage(m string) (command, *result) {
 	if kind == "DEPOSITO" || kind == "TRANSFER" {
 		amount := c.Args[len(c.Args)-1]
 		value, err := strconv.ParseInt(amount, 10, 64)
-		if !digits(amount) || err != nil || value <= 0 {
+		if !digits(amount) || (len(amount) > 1 && amount[0] == '0') || err != nil || value <= 0 || value > 9999999999 {
 			return bad("E303", "monto inválido")
 		}
 		c.Amount = value

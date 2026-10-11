@@ -36,7 +36,7 @@ func (s *Store) transfer(ctx context.Context, tx pgx.Tx, op operation) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
-	if op.Amount > 100000 {
+	if op.Amount > 50000 {
 		return failure(422, "E506", "límite excedido"), nil
 	}
 	if balances[source] < op.Amount {

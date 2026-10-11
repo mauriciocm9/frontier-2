@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -75,16 +80,23 @@ type api struct {
 	token, tenant string
 }
 
+var requestCounter atomic.Int64
+
+// write emits compact JSON (stored JSONB bodies are re-spaced by Postgres).
 func write(w http.ResponseWriter, res result) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	body := res.Body
+	var buf bytes.Buffer
+	if json.Compact(&buf, body) == nil {
+		body = buf.Bytes()
+	}
 	w.WriteHeader(res.Status)
-	_, _ = w.Write(res.Body)
+	_, _ = w.Write(body)
 }
 
 func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 4500*time.Millisecond)
 	defer cancel()
-	// ALB readiness is separate from the authenticated compatibility endpoint.
 	if r.Method == "GET" && r.URL.Path == "/ready" {
 		if err := a.store.Ping(ctx); err != nil {
 			write(w, failure(503, "E503", "servicio no disponible"))
@@ -93,14 +105,19 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The original resolves the route before authentication: unknown
+	// method/path pairs answer 404 even without a token.
+	known := (r.Method == "GET" && r.URL.Path == "/health") || (r.Method == "POST" && (r.URL.Path == "/__reset" || r.URL.Path == "/msg"))
+	if !known {
+		write(w, failure(404, "E404", "ruta desconocida"))
+		return
+	}
 	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+a.token)) != 1 {
 		write(w, failure(401, "E001", "no autorizado"))
 		return
 	}
+	w.Header().Set("X-Req", strconv.FormatInt(requestCounter.Add(1), 10))
 	switch {
-	case r.Method == "GET" && r.URL.Path == "/":
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("hello world\n"))
 	case r.Method == "GET" && r.URL.Path == "/health":
 		if err := a.store.Ping(ctx); err != nil {
 			a.internalError(w, err)
@@ -126,7 +143,17 @@ func (a *api) internalError(w http.ResponseWriter, err error) {
 }
 
 func (a *api) message(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024))
+	raw, rerr := io.ReadAll(io.LimitReader(r.Body, 8193))
+	if rerr != nil {
+		write(w, failure(400, "E100", "json inválido"))
+		return
+	}
+	if len(raw) > 8192 {
+		write(w, failure(413, "E101", "cuerpo demasiado grande"))
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var decoded any
 	if err := decoder.Decode(&decoded); err != nil {
 		write(w, failure(400, "E100", "json inválido"))
@@ -152,7 +179,7 @@ func (a *api) message(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		write(w, response(200, map[string]bool{"pong": true}))
 		return
 	case "ALTA":
-		account, err := a.store.CreateAccount(ctx, a.tenant, c.Args[0])
+		account, err := a.store.CreateAccount(ctx, a.tenant, strings.ReplaceAll(c.Args[0], "\x00", ""))
 		if err != nil {
 			a.internalError(w, err)
 		} else {
@@ -166,15 +193,18 @@ func (a *api) message(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		} else if err != nil {
 			a.internalError(w, err)
 		} else {
-			write(w, response(200, map[string]any{"cuenta_id": account.ID, "saldo": account.Balance}))
+			var saldo string
+			if account.Balance < 0 {
+				saldo = fmt.Sprintf("-%d.%02d", -account.Balance/100, -account.Balance%100)
+			} else {
+				saldo = fmt.Sprintf("%d.%02d", account.Balance/100, account.Balance%100)
+			}
+			write(w, response(200, map[string]any{"cuenta_id": account.ID, "saldo": saldo}))
 		}
 		return
 	}
-	key := r.Header.Get("Idempotency-Key")
-	if len(key) > 128 {
-		write(w, failure(400, "E105", "clave de idempotencia inválida"))
-		return
-	}
+	// The original ignores Idempotency-Key: every money request is a new operation.
+	key := ""
 	var id string
 	var err error
 	switch c.Kind {
